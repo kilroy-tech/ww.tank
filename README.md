@@ -38,4 +38,4 @@ Open the widget in a webwidget instance. Enter your desired username and click J
 
 ## Files
 
-- `tank.html` — Main game file (self-contained HTML with embedded CSS and JavaScript)
+- `index.html` — Main game file (self-contained HTML with embedded CSS and JavaScript)

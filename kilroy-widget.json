@@ -1,0 +1,6 @@
+{
+  "name": "Kilroy Tank Game",
+  "description": "A multiplayer real-time tank battle game.",
+  "swarm": "public",
+  "audience": "group"
+}

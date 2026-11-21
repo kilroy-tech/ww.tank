@@ -32,7 +32,7 @@ A multiplayer tank battle game that runs as a Kilroy webwidget. Players join wit
 
 | Command | Usage |
 |---------|-------|
-| Open game | Open `tank.html` in a webwidget instance |
+| Open game | Open `index.html` in a webwidget instance |
 | Join game | Enter username and click JOIN |
 | Leave game | Click LEAVE or press ESC |
 
