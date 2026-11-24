@@ -89,6 +89,20 @@
         #joinBtn:active {
             transform: scale(0.98);
         }
+
+        #joinBtn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .lobby-status {
+            font-size: 0.95em;
+        }
+
+        .lobby-status.error {
+            color: #ffd0d0;
+            font-weight: bold;
+        }
         
         #gameScreen {
             display: none;
@@ -130,6 +144,35 @@
             opacity: 0.7;
             margin-top: 10px;
         }
+
+        #joystick {
+            display: none;
+            position: relative;
+            align-self: center;
+            width: 120px;
+            height: 120px;
+            border: 2px solid #8a9ff5;
+            border-radius: 50%;
+            background: rgba(102, 126, 234, 0.16);
+            touch-action: none;
+            user-select: none;
+        }
+
+        #joystick-knob {
+            position: absolute;
+            width: 44px;
+            height: 44px;
+            top: 50%;
+            left: 50%;
+            margin: -22px;
+            border-radius: 50%;
+            background: #8a9ff5;
+            pointer-events: none;
+        }
+
+        @media (pointer: coarse) {
+            #joystick { display: block; }
+        }
         
         #leaveBtn {
             align-self: center;
@@ -160,8 +203,9 @@
                     placeholder="Enter your name"
                     maxlength="20"
                 >
-                <button id="joinBtn">JOIN</button>
+                <button id="joinBtn" disabled>JOIN</button>
             </div>
+            <p id="lobbyStatus" class="lobby-status" role="status">Connecting...</p>
         </div>
         
         <!-- Game Screen -->
@@ -173,6 +217,9 @@
             <div id="canvasContainer">
                 <canvas id="gameCanvas"></canvas>
             </div>
+            <div id="joystick" role="img" aria-label="Touch joystick for moving and turning">
+                <div id="joystick-knob"></div>
+            </div>
             <div class="controls">
                 <strong>Controls:</strong> WASD to move, rotate | SPACE to shoot (coming soon) | ESC to leave
             </div>
@@ -183,30 +230,6 @@
     <script type="module">
         import { initWebWidget } from "/apps/kilroy.utils/lib/kilroy/js/webwidget_sdk.js";
 
-        const sparams = new Proxy(new URLSearchParams(window.location.search), {
-            get: (searchParams, prop) => searchParams.get(prop),
-        });
-        const alias = (sparams.alias || "").trim();
-        const guid = (sparams.guid || "").trim();
-
-        window._pendingRemoteMessages = window._pendingRemoteMessages || [];
-
-        const sdk = initWebWidget({ alias, guid });
-        window.webwidgetSDK = sdk;
-        window.webwidgetSDKReady = sdk.ready;
-
-        sdk.onMessage((event) => {
-            if (!event.message) {
-                return;
-            }
-
-            window._pendingRemoteMessages.push({
-                messageText: event.message,
-                username: event.username,
-            });
-        });
-    </script>
-    <script>
         // ==================== CONFIGURATION ====================
         const CONFIG = {
             CANVAS_WIDTH: 800,
@@ -216,35 +239,47 @@
             TANK_ROTATION_SPEED: 180,  // degrees per second
             SEND_UPDATE_INTERVAL: 100, // ms between network updates
             PLAYER_TIMEOUT: 5000,      // ms to remove inactive player
-            MESSAGE_PREFIX: '/webwidget.tank ',
-            FILTER_PATTERN: '/webwidget.tank'
+            MESSAGE_PREFIX: '/ww.tank ',
+            FILTERS: ['^/ww\\.tank '],
+            MAX_NAME: 20
         };
 
         // ==================== STATE ====================
-        let gameState = {
+        const gameState = {
             username: null,
-            localTank: {
+            localTank: null,
+            remoteTanks: new Map(),      // username -> { name, x, y, orientation, lastUpdate }
+            keys: {},
+            touchKeys: {},
+            lastSendTime: 0,
+            lastHeartbeatTime: 0,
+            lastSentPosition: { x: null, y: null, orientation: null },
+            isInGame: false
+        };
+
+        const params = new URLSearchParams(window.location.search);
+        const alias = (params.get('alias') || '').trim();
+        const groupName = (params.get('group_name') || '').trim();
+        let sdk = null;
+        let connected = false;
+        let ready = false;
+        let closed = false;
+        const subscriptions = [];
+
+        function freshLocalTank() {
+            return {
                 x: CONFIG.CANVAS_WIDTH / 2,
                 y: CONFIG.CANVAS_HEIGHT / 2,
                 orientation: 0,           // degrees (0 = right, 90 = down)
                 velocityX: 0,
                 velocityY: 0,
                 rotationVelocity: 0       // degrees per second
-            },
-            remoteTanks: {},             // { username -> { x, y, orientation, lastUpdate } }
-            keys: {},                    // { keyCode -> bool }
-            lastSendTime: 0,
-            lastHeartbeatTime: 0,
-            lastSentPosition: { x: null, y: null, orientation: null },
-            remoteMessagePollerId: null,
-            isInGame: false
-        };
+            };
+        }
+        gameState.localTank = freshLocalTank();
 
         // ==================== UTILITY FUNCTIONS ====================
-        
-        /**
-         * Simple hash function to convert username to RGB color
-         */
+
         function hashToColor(str) {
             let hash = 0;
             for (let i = 0; i < str.length; i++) {
@@ -276,9 +311,10 @@
         }
 
         // ==================== UI EVENTS ====================
-        
+
         const usernameInput = document.getElementById('usernameInput');
         const joinBtn = document.getElementById('joinBtn');
+        const lobbyStatus = document.getElementById('lobbyStatus');
         const lobbyScreen = document.getElementById('lobbyScreen');
         const gameScreen = document.getElementById('gameScreen');
         const playerNameDisplay = document.getElementById('playerName');
@@ -286,50 +322,50 @@
         const leaveBtn = document.getElementById('leaveBtn');
 
         joinBtn.addEventListener('click', joinGame);
-        usernameInput.addEventListener('keypress', (e) => {
+        usernameInput.addEventListener('keydown', (e) => {
             if (e.key === 'Enter') joinGame();
         });
         leaveBtn.addEventListener('click', leaveGame);
 
+        function setStatus(text, isError = false) {
+            lobbyStatus.textContent = text;
+            lobbyStatus.classList.toggle('error', isError);
+        }
+
+        function updateControls() {
+            joinBtn.disabled = closed || !ready || !connected;
+        }
+
         // ==================== GAME FLOW ====================
-        
+
         function joinGame() {
-            const username = usernameInput.value.trim();
+            const username = usernameInput.value.trim().slice(0, CONFIG.MAX_NAME);
             if (!username) {
-                alert('Please enter a name');
+                usernameInput.focus();
                 return;
             }
+            if (joinBtn.disabled) return;
 
             gameState.username = username;
             gameState.isInGame = true;
             playerNameDisplay.textContent = username;
 
-            // Switch UI
             lobbyScreen.style.display = 'none';
             gameScreen.style.display = 'flex';
 
-            // Initialize webwidget SDK
-            initializeWebwidget();
-
-            // Start game loop
             startGameLoop();
         }
 
         function leaveGame() {
             gameState.isInGame = false;
-            gameState.remoteTanks = {};
-            gameState.localTank = {
-                x: CONFIG.CANVAS_WIDTH / 2,
-                y: CONFIG.CANVAS_HEIGHT / 2,
-                orientation: 0,
-                velocityX: 0,
-                velocityY: 0,
-                rotationVelocity: 0
-            };
+            stopGameLoop();
+            gameState.remoteTanks.clear();
+            gameState.localTank = freshLocalTank();
             gameState.lastSentPosition = { x: null, y: null, orientation: null };
             gameState.lastHeartbeatTime = 0;
+            gameState.keys = {};
+            resetJoystick();
 
-            // Switch UI
             gameScreen.style.display = 'none';
             lobbyScreen.style.display = 'flex';
             usernameInput.value = '';
@@ -337,82 +373,51 @@
         }
 
         // ==================== WEBWIDGET INTEGRATION ====================
-        
-        function initializeWebwidget() {
-            const applyFilters = () => {
-                if (!window.webwidgetSDK || !window.webwidgetSDK.setMessageFilters) {
-                    return;
-                }
 
-                window.webwidgetSDK.setMessageFilters([CONFIG.FILTER_PATTERN]).catch(() => {});
-            };
+        function isFiniteNumber(value) {
+            return typeof value === 'number' && Number.isFinite(value);
+        }
 
-            if (window.webwidgetSDKReady && typeof window.webwidgetSDKReady.then === 'function') {
-                window.webwidgetSDKReady.then(applyFilters).catch(() => {});
-            } else {
-                applyFilters();
-            }
+        function handleIncoming(event) {
+            if (closed || !gameState.isInGame || typeof event.message !== 'string') return;
+            if (!event.message.startsWith(CONFIG.MESSAGE_PREFIX)) return;
 
-            if (gameState.remoteMessagePollerId) {
+            let update;
+            try {
+                update = JSON.parse(event.message.slice(CONFIG.MESSAGE_PREFIX.length));
+            } catch (_err) {
                 return;
             }
+            if (!update || typeof update !== 'object') return;
 
-            gameState.remoteMessagePollerId = setInterval(() => {
-                const pending = Array.isArray(window._pendingRemoteMessages)
-                    ? window._pendingRemoteMessages.splice(0, window._pendingRemoteMessages.length)
-                    : [];
+            const name = typeof update.username === 'string' ? update.username.trim().slice(0, CONFIG.MAX_NAME) : '';
+            if (!name || !isFiniteNumber(update.x) || !isFiniteNumber(update.y) || !isFiniteNumber(update.orientation)) return;
 
-                pending.forEach(({ messageText }) => {
-                    if (!messageText.startsWith(CONFIG.MESSAGE_PREFIX)) {
-                        return;
-                    }
-
-                    try {
-                        const jsonStr = messageText.substring(CONFIG.MESSAGE_PREFIX.length);
-                        const update = JSON.parse(jsonStr);
-
-                        if (update.username !== gameState.username) {
-                            gameState.remoteTanks[update.username] = {
-                                x: update.x,
-                                y: update.y,
-                                orientation: update.orientation,
-                                lastUpdate: Date.now()
-                            };
-                        }
-                    } catch (_err) {}
-                });
-            }, 50);
+            gameState.remoteTanks.set(name, {
+                name,
+                x: Math.max(0, Math.min(CONFIG.CANVAS_WIDTH, update.x)),
+                y: Math.max(0, Math.min(CONFIG.CANVAS_HEIGHT, update.y)),
+                orientation: normalizeAngle(update.orientation),
+                lastUpdate: Date.now()
+            });
         }
 
         function sendTankUpdate() {
-            // Skip if SDK unavailable
-            if (!window.webwidgetSDK || !window.webwidgetSDK.sendMessage) {
-                return;
-            }
+            if (!sdk || !ready || !connected) return;
 
             const now = Date.now();
             const newX = Math.round(gameState.localTank.x);
             const newY = Math.round(gameState.localTank.y);
             const newOrientation = Math.round(gameState.localTank.orientation);
 
-            // Only send if position has ACTUALLY changed
-            const positionChanged = 
+            const positionChanged =
                 gameState.lastSentPosition.x !== newX ||
                 gameState.lastSentPosition.y !== newY ||
                 gameState.lastSentPosition.orientation !== newOrientation;
 
-            // If position didn't change, check if heartbeat interval has elapsed
-            if (!positionChanged) {
-                // Send keep-alive heartbeat every 4 seconds to prevent remote tank from disappearing
-                if (now - gameState.lastHeartbeatTime < 4000) {
-                    return;
-                }
-            }
-
-            // Rate limit: don't send more than once per interval
-            if (now - gameState.lastSendTime < CONFIG.SEND_UPDATE_INTERVAL) {
-                return;
-            }
+            // Heartbeat every 4s keeps this tank from timing out on peers.
+            if (!positionChanged && now - gameState.lastHeartbeatTime < 4000) return;
+            if (now - gameState.lastSendTime < CONFIG.SEND_UPDATE_INTERVAL) return;
 
             gameState.lastSendTime = now;
             gameState.lastHeartbeatTime = now;
@@ -425,17 +430,107 @@
                 orientation: newOrientation
             };
 
-            // ALWAYS prefix with slash command - this is required by the protocol
-            const message = CONFIG.MESSAGE_PREFIX + JSON.stringify(update);
-            window.webwidgetSDK.sendMessage(message, {
+            sdk.sendMessage(CONFIG.MESSAGE_PREFIX + JSON.stringify(update), {
                 username: gameState.username,
                 type: 'text/plain'
+            }).catch((err) => {
+                console.warn('[tank] send failed', err);
             });
         }
 
+        function closeWidget() {
+            if (closed) return;
+            closed = true;
+            ready = false;
+            gameState.isInGame = false;
+            resetJoystick();
+            stopGameLoop();
+            subscriptions.forEach((unsubscribe) => unsubscribe());
+            if (sdk) sdk.disconnect();
+            setStatus('Closed');
+            updateControls();
+        }
+
+        async function initWidget() {
+            if (!alias || !groupName) {
+                setStatus('Configuration error: this widget must be launched by Kilroy (missing alias or group_name).', true);
+                updateControls();
+                return;
+            }
+            try {
+                sdk = initWebWidget({ focusBridgeEnabled: true, targetOrigin: window.location.origin });
+                connected = sdk.connected;
+                subscriptions.push(sdk.onConnectionState((event) => {
+                    connected = !!event.connected;
+                    if (ready) setStatus(connected ? 'Connected' : 'Disconnected', !connected);
+                    updateControls();
+                }));
+                subscriptions.push(sdk.onMessage(handleIncoming));
+                subscriptions.push(sdk.onLifecycle(({ event }) => {
+                    if (event === 'WIDGET_CLOSING') closeWidget();
+                }));
+                await sdk.ready;
+                await sdk.setMessageFilters(CONFIG.FILTERS);
+                if (closed) return;
+                connected = sdk.connected;
+                ready = true;
+                setStatus(connected ? 'Connected' : 'Disconnected', !connected);
+            } catch (err) {
+                setStatus('Initialization failed: ' + (err?.message || err), true);
+            }
+            updateControls();
+        }
+
         // ==================== INPUT HANDLING ====================
-        
+
+        const joystick = document.getElementById('joystick');
+        const joystickKnob = document.getElementById('joystick-knob');
+        let joystickPointer = null;
+
+        function resetJoystick() {
+            joystickPointer = null;
+            gameState.touchKeys = {};
+            joystickKnob.style.transform = '';
+        }
+
+        function updateJoystick(event) {
+            const rect = joystick.getBoundingClientRect();
+            const radius = Math.min(rect.width, rect.height) / 2;
+            let x = (event.clientX - (rect.left + rect.width / 2)) / radius;
+            let y = (event.clientY - (rect.top + rect.height / 2)) / radius;
+            const distance = Math.hypot(x, y);
+            if (distance > 1) {
+                x /= distance;
+                y /= distance;
+            }
+            const deadZone = 0.25;
+            gameState.touchKeys = { W: y < -deadZone, S: y > deadZone, A: x < -deadZone, D: x > deadZone };
+            const travel = Math.max(0, radius - joystickKnob.offsetWidth / 2);
+            joystickKnob.style.transform = `translate(${x * travel}px, ${y * travel}px)`;
+        }
+
+        joystick.addEventListener('pointerdown', (event) => {
+            if (!gameState.isInGame || joystickPointer !== null) return;
+            event.preventDefault();
+            joystickPointer = event.pointerId;
+            joystick.setPointerCapture(event.pointerId);
+            updateJoystick(event);
+        });
+        joystick.addEventListener('pointermove', (event) => {
+            if (event.pointerId === joystickPointer) updateJoystick(event);
+        });
+        for (const eventName of ['pointerup', 'pointercancel', 'lostpointercapture']) {
+            joystick.addEventListener(eventName, (event) => {
+                if (event.pointerId === joystickPointer) resetJoystick();
+            });
+        }
+        window.addEventListener('blur', () => {
+            gameState.keys = {};
+            resetJoystick();
+        });
+
         document.addEventListener('keydown', (e) => {
+            if (!gameState.isInGame) return;
             gameState.keys[e.key.toUpperCase()] = true;
 
             if (e.key === 'Escape') {
@@ -447,8 +542,12 @@
             gameState.keys[e.key.toUpperCase()] = false;
         });
 
+        window.addEventListener('pagehide', (event) => {
+            if (!event.persisted) closeWidget();
+        });
+
         // ==================== GAME LOOP ====================
-        
+
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
         let gameLoopId = null;
@@ -456,43 +555,35 @@
         function resizeCanvas() {
             const container = document.getElementById('canvasContainer');
             const rect = container.getBoundingClientRect();
-            const w = Math.floor(rect.width) || CONFIG.CANVAS_WIDTH;
-            const h = Math.floor(rect.height) || CONFIG.CANVAS_HEIGHT;
-            canvas.width = w;
-            canvas.height = h;
+            canvas.width = Math.floor(rect.width) || CONFIG.CANVAS_WIDTH;
+            canvas.height = Math.floor(rect.height) || CONFIG.CANVAS_HEIGHT;
         }
 
         function startGameLoop() {
-            // Ensure canvas is sized before starting
-            setTimeout(() => {
-                resizeCanvas();
-            }, 50);
-            
+            stopGameLoop();
+            setTimeout(resizeCanvas, 50);
             window.addEventListener('resize', resizeCanvas);
-            gameLoopId = setInterval(gameLoop, 1000 / 60); // 60 FPS
+            gameLoopId = setInterval(gameLoop, 1000 / 60);
+        }
+
+        function stopGameLoop() {
+            if (gameLoopId) clearInterval(gameLoopId);
+            gameLoopId = null;
+            window.removeEventListener('resize', resizeCanvas);
         }
 
         function gameLoop() {
             if (!gameState.isInGame) {
-                clearInterval(gameLoopId);
-                window.removeEventListener('resize', resizeCanvas);
+                stopGameLoop();
                 return;
             }
 
-            // Update local tank physics
-            updateLocalTank(1 / 60); // ~16ms per frame
-
-            // Remove stale remote tanks
+            updateLocalTank(1 / 60);
             removeStaleRemoteTanks();
-
-            // Send update to swarm if moved significantly
             sendTankUpdate();
-
-            // Render
             render();
 
-            // Update tank count
-            tankCountDisplay.textContent = Object.keys(gameState.remoteTanks).length + 1;
+            tankCountDisplay.textContent = gameState.remoteTanks.size + 1;
         }
 
         function updateLocalTank(deltaTime) {
@@ -504,7 +595,12 @@
             tank.rotationVelocity = 0;
 
             // Input handling
-            const keys = gameState.keys;
+            const keys = {
+                W: gameState.keys.W || gameState.touchKeys.W,
+                S: gameState.keys.S || gameState.touchKeys.S,
+                A: gameState.keys.A || gameState.touchKeys.A,
+                D: gameState.keys.D || gameState.touchKeys.D
+            };
             
             // Forward (W)
             if (keys['W']) {
@@ -544,42 +640,33 @@
 
         function removeStaleRemoteTanks() {
             const now = Date.now();
-            for (const username in gameState.remoteTanks) {
-                const tank = gameState.remoteTanks[username];
+            for (const [name, tank] of gameState.remoteTanks) {
                 if (now - tank.lastUpdate > CONFIG.PLAYER_TIMEOUT) {
-                    delete gameState.remoteTanks[username];
+                    gameState.remoteTanks.delete(name);
                 }
             }
         }
 
         function render() {
-            // Ensure canvas has valid dimensions
             if (!canvas.width || !canvas.height) {
                 resizeCanvas();
                 if (!canvas.width || !canvas.height) return;
             }
 
-            // Clear canvas
             ctx.fillStyle = '#000';
             ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // Draw border
             ctx.strokeStyle = '#667eea';
             ctx.lineWidth = 2;
             ctx.strokeRect(0, 0, canvas.width, canvas.height);
 
-            // Calculate scale factor (canvas size vs game space size)
             const scaleX = canvas.width / CONFIG.CANVAS_WIDTH;
             const scaleY = canvas.height / CONFIG.CANVAS_HEIGHT;
 
-            // Draw local tank (blue)
             drawTank(gameState.localTank, '#4299ff', true, scaleX, scaleY);
 
-            // Draw remote tanks (hashed colors)
-            for (const username in gameState.remoteTanks) {
-                const tank = gameState.remoteTanks[username];
-                const color = hashToColor(username);
-                drawTank(tank, color, false, scaleX, scaleY);
+            for (const tank of gameState.remoteTanks.values()) {
+                drawTank(tank, hashToColor(tank.name), false, scaleX, scaleY);
             }
         }
 
@@ -625,13 +712,11 @@
                 ctx.fillStyle = '#fff';
                 ctx.font = '11px Arial';
                 ctx.textAlign = 'center';
-                ctx.fillText(
-                    Object.keys(gameState.remoteTanks).find(k => gameState.remoteTanks[k] === tank) || '?',
-                    x,
-                    y + size + 12
-                );
+                ctx.fillText(tank.name, x, y + size + 12);
             }
         }
+
+        initWidget();
     </script>
 </body>
 </html>

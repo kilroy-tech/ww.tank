@@ -59,9 +59,9 @@ A multiplayer tank battle game that runs as a Kilroy webwidget. Players join wit
 ## Webwidget Integration
 
 Uses the Kilroy webwidget SDK for cross-instance messaging:
-- Messages prefixed with `/webwidget.tank`
+- Messages prefixed with `/ww.tank `
 - JSON payload: `{username, x, y, orientation}`
-- Filter pattern: `/webwidget.tank`
+- Filter pattern: `^/ww\.tank `
 
 ## Output
 
